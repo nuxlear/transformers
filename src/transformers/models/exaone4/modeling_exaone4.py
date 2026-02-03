@@ -339,6 +339,49 @@ class Exaone4DecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
+class Exaone4MTPLayer(GradientCheckpointingLayer):
+    def __init__(self, config: Exaone4Config):
+        super().__init__()
+        self.config = config
+        self.pre_fc_norm_embedding = Exaone4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = Exaone4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.layers = nn.ModuleList(
+            [Exaone4DecoderLayer(config, config.num_hidden_layers + i) for i in range(config._num_mtp_layers)]
+        )
+        self.norm = Exaone4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Cache | None = None,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.Tensor:
+        embed_states = self.pre_fc_norm_embedding(inputs_embeds)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = self.fc(torch.cat([embed_states, hidden_states], dim=-1))
+
+        hidden_states = self.layers[layer_idx](
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+
 @auto_docstring
 class Exaone4PreTrainedModel(PreTrainedModel):
     config: Exaone4Config
@@ -448,6 +491,56 @@ class Exaone4Model(Exaone4PreTrainedModel):
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
         )
+
+
+@dataclass
+class Exaone4CausalLMOutputWithPast(CausalLMOutputWithPast):
+    """
+    Base class for causal language model (or autoregressive) outputs.
+
+    Args:
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+            Language modeling loss (for next-token prediction).
+        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+            It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
+
+            Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
+            `past_key_values` input) to speed up sequential decoding.
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+        mtp_loss (`tuple(torch.FloatTensor)`, *optional*, returned when `labels` is provided):
+            Language modeling loss (for next-token prediction) for each MTP layer.
+        mtp_logits (`tuple(torch.FloatTensor)`, *optional*, returned when `labels` is provided):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax) for each MTP layer.
+        mtp_hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+            Hidden-states of the model at the output of each MTP layer plus the optional initial embedding outputs.
+    """
+
+    mtp_loss: tuple[torch.FloatTensor, ...] | None = None
+    mtp_logits: tuple[torch.FloatTensor, ...] | None = None
+    mtp_hidden_states: tuple[torch.FloatTensor, ...] | None = None
+
+
+def roll_tensor(tensor, shifts=-1, dims=-1, fill_value=0):
+    """Roll the tensor input along the given dimension(s).
+    Inserted elements are set to be 0.0.
+    """
+    rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
+    rolled_tensor.select(dims, shifts).fill_(fill_value)
+    return rolled_tensor, rolled_tensor.sum()
 
 
 @auto_docstring

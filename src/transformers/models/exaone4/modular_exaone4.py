@@ -213,7 +213,9 @@ class Exaone4Config(PreTrainedConfig):
                 else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
-        layer_type_validation(self.layer_types, self.num_hidden_layers)
+        if self._num_mtp_layers > 0 and len(self.layer_types) < self.num_hidden_layers + self._num_mtp_layers:
+            self.layer_types += ["sliding_attention"] * (self.num_hidden_layers + self._num_mtp_layers - len(self.layer_types))
+        layer_type_validation(self.layer_types, self.num_hidden_layers + self._num_mtp_layers)
 
         self.rope_parameters = rope_parameters
 
