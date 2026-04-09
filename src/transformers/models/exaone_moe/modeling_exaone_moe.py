@@ -20,6 +20,7 @@
 # limitations under the License.
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -37,10 +38,13 @@ from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
-from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, is_grouped_mm_available
-from ...utils.generic import maybe_autocast, merge_with_config_defaults
+from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, is_grouped_mm_available, logging
+from ...utils.generic import check_model_inputs, maybe_autocast, merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
 from .configuration_exaone_moe import ExaoneMoeConfig
+
+
+logger = logging.get_logger(__name__)
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -403,8 +407,8 @@ class ExaoneMoePreTrainedModel(PreTrainedModel):
         "router_logits": ExaoneMoeSparseMoEBlock,
     }
     config_class = ExaoneMoeConfig
-    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
     _keys_to_ignore_on_load_unexpected = [r"mtp.*"]
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 
     @torch.no_grad()
     def _init_weights(self, module):
@@ -573,6 +577,99 @@ class ExaoneMoeModel(ExaoneMoePreTrainedModel):
         )
 
 
+class ExaoneMoeMTPLayer(GradientCheckpointingLayer):
+    def __init__(self, config: ExaoneMoeConfig):
+        super().__init__()
+        self.config = config
+        self.pre_fc_norm_embedding = ExaoneMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = ExaoneMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.layers = nn.ModuleList(
+            [ExaoneMoeDecoderLayer(config, config.num_hidden_layers + i) for i in range(config._num_mtp_layers)]
+        )
+        self.norm = ExaoneMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Cache | None = None,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.Tensor:
+        embed_states = self.pre_fc_norm_embedding(inputs_embeds)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = self.fc(torch.cat([embed_states, hidden_states], dim=-1))
+
+        hidden_states = self.layers[layer_idx](
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+
+@dataclass
+class ExaoneMoeCausalLMOutputWithPast(CausalLMOutputWithPast):
+    """
+    Base class for causal language model (or autoregressive) outputs.
+
+    Args:
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+            Language modeling loss (for next-token prediction).
+        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+            It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
+
+            Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
+            `past_key_values` input) to speed up sequential decoding.
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+        mtp_loss (`tuple(torch.FloatTensor)`, *optional*, returned when `labels` is provided):
+            Language modeling loss (for next-token prediction) for each MTP layer.
+        mtp_logits (`tuple(torch.FloatTensor)`, *optional*, returned when `labels` is provided):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax) for each MTP layer.
+        mtp_hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+            Hidden-states of the model at the output of each MTP layer plus the optional initial embedding outputs.
+    """
+
+    mtp_loss: tuple[torch.FloatTensor, ...] | None = None
+    mtp_logits: tuple[torch.FloatTensor, ...] | None = None
+    mtp_hidden_states: tuple[torch.FloatTensor, ...] | None = None
+
+
+def roll_tensor(tensor, shifts=-1, dims=-1, fill_value=0):
+    """Roll the tensor input along the given dimension(s).
+    Inserted elements are set to be 0.0.
+    """
+    rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
+    rolled_tensor.select(dims, shifts).fill_(fill_value)
+    return rolled_tensor, rolled_tensor.sum()
+
+
 @auto_docstring
 class ExaoneMoeForCausalLM(ExaoneMoePreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -584,6 +681,8 @@ class ExaoneMoeForCausalLM(ExaoneMoePreTrainedModel, GenerationMixin):
         self.model = ExaoneMoeModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config._num_mtp_layers > 0:
+            self.mtp = ExaoneMoeMTPLayer(config)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -646,6 +745,7 @@ class ExaoneMoeForCausalLM(ExaoneMoePreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs.last_hidden_state
+
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
@@ -654,11 +754,111 @@ class ExaoneMoeForCausalLM(ExaoneMoePreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        return CausalLMOutputWithPast(
+        mtp_losses = []
+        mtp_logits_list = []
+        mtp_hidden_states_list = []
+        if self.config.num_nextn_predict_layers > 0:
+            mtp_labels = None
+            if labels is not None:
+                mtp_labels = labels.clone()
+
+            if cache_position is None:
+                past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+                if input_ids is not None:
+                    seq_len = input_ids.shape[1]
+                    seq_device = input_ids.device
+                elif inputs_embeds is not None:
+                    seq_len = inputs_embeds.shape[1]
+                    seq_device = inputs_embeds.device
+                else:
+                    seq_len = hidden_states.shape[1]
+                    seq_device = hidden_states.device
+                cache_position = torch.arange(past_seen_tokens, past_seen_tokens + seq_len, device=seq_device)
+            mtp_position_ids = position_ids
+            if mtp_position_ids is None:
+                mtp_position_ids = cache_position.unsqueeze(0)
+            mtp_cache_position = cache_position
+
+            mtp_hidden_states = hidden_states
+            mtp_input_ids = input_ids
+            mtp_attention_mask = attention_mask
+            if mtp_input_ids is None:
+                logger.warning_once(
+                    "MTP computation requires `input_ids` for token shifting, but `inputs_embeds`-only inputs were provided. "
+                    "Skipping MTP branch."
+                )
+            else:
+                mtp_past_key_values = DynamicCache(config=self.config) if use_cache else None
+
+                mtp_input_ids, _ = roll_tensor(mtp_input_ids, shifts=-1, dims=-1)
+                mtp_position_ids, _ = roll_tensor(
+                    mtp_position_ids, shifts=-1, dims=-1, fill_value=mtp_position_ids.max() + 1
+                )
+                mtp_cache_position, _ = roll_tensor(
+                    mtp_cache_position, shifts=-1, dims=-1, fill_value=mtp_cache_position.max() + 1
+                )
+                mtp_inputs_embeds = self.model.embed_tokens(mtp_input_ids)
+                first_mtp_layer_idx = 0 if self.config.mtp_share_layers else 0
+                causal_mask_mapping = {
+                    "full_attention": create_causal_mask,
+                    "sliding_attention": create_sliding_window_causal_mask,
+                }
+                # Build one reusable causal mask for MTP branch.
+                mtp_attention_mask = causal_mask_mapping[
+                    self.config.layer_types[self.config.num_hidden_layers + first_mtp_layer_idx]
+                ](
+                    config=self.config,
+                    input_embeds=mtp_inputs_embeds,
+                    attention_mask=mtp_attention_mask,
+                    cache_position=mtp_cache_position,
+                    past_key_values=mtp_past_key_values,
+                    position_ids=mtp_position_ids,
+                )
+                for layer_idx in range(self.config.num_nextn_predict_layers):
+                    if layer_idx > 0:
+                        mtp_input_ids, _ = roll_tensor(mtp_input_ids, shifts=-1, dims=-1)
+                        mtp_position_ids, _ = roll_tensor(
+                            mtp_position_ids, shifts=-1, dims=-1, fill_value=mtp_position_ids.max() + 1
+                        )
+                        mtp_cache_position, _ = roll_tensor(
+                            mtp_cache_position, shifts=-1, dims=-1, fill_value=mtp_cache_position.max() + 1
+                        )
+                        mtp_inputs_embeds = self.model.embed_tokens(mtp_input_ids)
+                    position_embeddings = self.model.rotary_emb(mtp_inputs_embeds, mtp_position_ids)
+                    mtp_layer_idx = 0 if self.config.mtp_share_layers else layer_idx
+
+                    mtp_hidden_states = self.mtp(
+                        layer_idx=mtp_layer_idx,
+                        hidden_states=mtp_hidden_states,
+                        inputs_embeds=mtp_inputs_embeds,
+                        position_embeddings=position_embeddings,
+                        attention_mask=mtp_attention_mask,
+                        position_ids=mtp_position_ids,
+                        past_key_value=mtp_past_key_values,
+                        use_cache=use_cache,
+                        cache_position=mtp_cache_position,
+                        **kwargs,
+                    )
+                    mtp_hidden_states_list.append(mtp_hidden_states)
+
+                    mtp_logits = self.lm_head(mtp_hidden_states[:, slice_indices, :])
+                    mtp_logits_list.append(mtp_logits)
+
+                    if mtp_labels is not None:
+                        mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, fill_value=-100)
+                        mtp_loss = self.loss_function(
+                            logits=mtp_logits, labels=mtp_labels, vocab_size=self.config.vocab_size, **kwargs
+                        )
+                        mtp_losses.append(mtp_loss)
+
+        return ExaoneMoeCausalLMOutputWithPast(
             loss=loss,
+            mtp_loss=mtp_losses or None,
             logits=logits,
+            mtp_logits=mtp_logits_list or None,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
+            mtp_hidden_states=mtp_hidden_states_list or None,
             attentions=outputs.attentions,
         )
 

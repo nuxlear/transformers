@@ -20,6 +20,7 @@
 # limitations under the License.
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -40,10 +41,13 @@ from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
-from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
+from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 from ...utils.generic import maybe_autocast, merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
 from .configuration_exaone4 import Exaone4Config
+
+
+logger = logging.get_logger(__name__)
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -400,6 +404,7 @@ class Exaone4PreTrainedModel(PreTrainedModel):
         "attentions": Exaone4Attention,
     }
     config_class = Exaone4Config
+    _keys_to_ignore_on_load_unexpected = [r"mtp.*"]
 
 
 @auto_docstring
@@ -554,6 +559,8 @@ class Exaone4ForCausalLM(Exaone4PreTrainedModel, GenerationMixin):
         self.model = Exaone4Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config._num_mtp_layers > 0:
+            self.mtp = Exaone4MTPLayer(config)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -572,7 +579,7 @@ class Exaone4ForCausalLM(Exaone4PreTrainedModel, GenerationMixin):
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> CausalLMOutputWithPast:
+    ) -> Exaone4CausalLMOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -616,6 +623,7 @@ class Exaone4ForCausalLM(Exaone4PreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs.last_hidden_state
+
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
@@ -624,11 +632,111 @@ class Exaone4ForCausalLM(Exaone4PreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        return CausalLMOutputWithPast(
+        mtp_losses = []
+        mtp_logits_list = []
+        mtp_hidden_states_list = []
+        if self.config.num_nextn_predict_layers > 0:
+            mtp_labels = None
+            if labels is not None:
+                mtp_labels = labels.clone()
+
+            if cache_position is None:
+                past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+                if input_ids is not None:
+                    seq_len = input_ids.shape[1]
+                    seq_device = input_ids.device
+                elif inputs_embeds is not None:
+                    seq_len = inputs_embeds.shape[1]
+                    seq_device = inputs_embeds.device
+                else:
+                    seq_len = hidden_states.shape[1]
+                    seq_device = hidden_states.device
+                cache_position = torch.arange(past_seen_tokens, past_seen_tokens + seq_len, device=seq_device)
+            mtp_position_ids = position_ids
+            if mtp_position_ids is None:
+                mtp_position_ids = cache_position.unsqueeze(0)
+            mtp_cache_position = cache_position
+
+            mtp_hidden_states = hidden_states
+            mtp_input_ids = input_ids
+            mtp_attention_mask = attention_mask
+            if mtp_input_ids is None:
+                logger.warning_once(
+                    "MTP computation requires `input_ids` for token shifting, but `inputs_embeds`-only inputs were provided. "
+                    "Skipping MTP branch."
+                )
+            else:
+                mtp_past_key_values = DynamicCache(config=self.config) if use_cache else None
+
+                mtp_input_ids, _ = roll_tensor(mtp_input_ids, shifts=-1, dims=-1)
+                mtp_position_ids, _ = roll_tensor(
+                    mtp_position_ids, shifts=-1, dims=-1, fill_value=mtp_position_ids.max() + 1
+                )
+                mtp_cache_position, _ = roll_tensor(
+                    mtp_cache_position, shifts=-1, dims=-1, fill_value=mtp_cache_position.max() + 1
+                )
+                mtp_inputs_embeds = self.model.embed_tokens(mtp_input_ids)
+                first_mtp_layer_idx = 0 if self.config.mtp_share_layers else 0
+                causal_mask_mapping = {
+                    "full_attention": create_causal_mask,
+                    "sliding_attention": create_sliding_window_causal_mask,
+                }
+                # Build one reusable causal mask for MTP branch.
+                mtp_attention_mask = causal_mask_mapping[
+                    self.config.layer_types[self.config.num_hidden_layers + first_mtp_layer_idx]
+                ](
+                    config=self.config,
+                    input_embeds=mtp_inputs_embeds,
+                    attention_mask=mtp_attention_mask,
+                    cache_position=mtp_cache_position,
+                    past_key_values=mtp_past_key_values,
+                    position_ids=mtp_position_ids,
+                )
+                for layer_idx in range(self.config.num_nextn_predict_layers):
+                    if layer_idx > 0:
+                        mtp_input_ids, _ = roll_tensor(mtp_input_ids, shifts=-1, dims=-1)
+                        mtp_position_ids, _ = roll_tensor(
+                            mtp_position_ids, shifts=-1, dims=-1, fill_value=mtp_position_ids.max() + 1
+                        )
+                        mtp_cache_position, _ = roll_tensor(
+                            mtp_cache_position, shifts=-1, dims=-1, fill_value=mtp_cache_position.max() + 1
+                        )
+                        mtp_inputs_embeds = self.model.embed_tokens(mtp_input_ids)
+                    position_embeddings = self.model.rotary_emb(mtp_inputs_embeds, mtp_position_ids)
+                    mtp_layer_idx = 0 if self.config.mtp_share_layers else layer_idx
+
+                    mtp_hidden_states = self.mtp(
+                        layer_idx=mtp_layer_idx,
+                        hidden_states=mtp_hidden_states,
+                        inputs_embeds=mtp_inputs_embeds,
+                        position_embeddings=position_embeddings,
+                        attention_mask=mtp_attention_mask,
+                        position_ids=mtp_position_ids,
+                        past_key_value=mtp_past_key_values,
+                        use_cache=use_cache,
+                        cache_position=mtp_cache_position,
+                        **kwargs,
+                    )
+                    mtp_hidden_states_list.append(mtp_hidden_states)
+
+                    mtp_logits = self.lm_head(mtp_hidden_states[:, slice_indices, :])
+                    mtp_logits_list.append(mtp_logits)
+
+                    if mtp_labels is not None:
+                        mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, fill_value=-100)
+                        mtp_loss = self.loss_function(
+                            logits=mtp_logits, labels=mtp_labels, vocab_size=self.config.vocab_size, **kwargs
+                        )
+                        mtp_losses.append(mtp_loss)
+
+        return Exaone4CausalLMOutputWithPast(
             loss=loss,
+            mtp_loss=mtp_losses or None,
             logits=logits,
+            mtp_logits=mtp_logits_list or None,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
+            mtp_hidden_states=mtp_hidden_states_list or None,
             attentions=outputs.attentions,
         )
 

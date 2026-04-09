@@ -183,6 +183,9 @@ class ExaoneMoeConfig(Exaone4Config):
         routed_scaling_factor=2.5,
         n_group=1,
         topk_group=1,
+        num_nextn_predict_layers: int | None = 0,
+        mtp_share_layers: bool | None = False,
+        mtp_loss_scaling_factor: float | None = 0.2,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -208,11 +211,19 @@ class ExaoneMoeConfig(Exaone4Config):
         self.routed_scaling_factor = routed_scaling_factor
         self.n_group = n_group
         self.topk_group = topk_group
+        self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.mtp_share_layers = mtp_share_layers
+        self.mtp_loss_scaling_factor = mtp_loss_scaling_factor
         self.rope_parameters = rope_parameters
 
-        self.layer_types = layer_types
+        self._num_mtp_layers = self.num_nextn_predict_layers
+        if self._num_mtp_layers > 0 and self.mtp_share_layers:
+            self._num_mtp_layers = 1
+
         if self.sliding_window is None:
             sliding_window_pattern = 0
+
+        self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = [
                 "sliding_attention"
@@ -220,14 +231,18 @@ class ExaoneMoeConfig(Exaone4Config):
                 else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
-        layer_type_validation(self.layer_types)
-
         self.mlp_layer_types = mlp_layer_types
         if self.mlp_layer_types is None:
             self.mlp_layer_types = [
                 "dense" if i < self.first_k_dense_replace else "sparse" for i in range(self.num_hidden_layers)
             ]
-        layer_type_validation(self.mlp_layer_types, self.num_hidden_layers, attention=False)
+
+        if self._num_mtp_layers > 0 and len(self.layer_types) < self.num_hidden_layers + self._num_mtp_layers:
+            self.layer_types += ["sliding_attention"] * (self.num_hidden_layers + self._num_mtp_layers - len(self.layer_types))
+            self.mlp_layer_types += ["dense"] * (self.num_hidden_layers + self._num_mtp_layers - len(self.mlp_layer_types))
+
+        layer_type_validation(self.layer_types, self.num_hidden_layers + self._num_mtp_layers)
+        layer_type_validation(self.mlp_layer_types, self.num_hidden_layers + self._num_mtp_layers, attention=False)
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id

@@ -4,7 +4,6 @@
 #             the file from the modular. If any change should be done, please apply the change to the
 #                          modular_exaone4_5.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
-# coding=utf-8
 # Copyright 2025 The LG AI Research and HuggingFace Inc. team. All rights reserved.
 #
 #
@@ -19,7 +18,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from ...configuration_utils import PreTrainedConfig, PretrainedConfig, layer_type_validation
 from ...modeling_rope_utils import RopeParameters
 
@@ -212,6 +210,10 @@ class Exaone4_5_TextConfig(PreTrainedConfig):
         self.attention_dropout = attention_dropout
         self.sliding_window = sliding_window
         self.sliding_window_pattern = sliding_window_pattern
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
+        self.tie_word_embeddings = tie_word_embeddings
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.mtp_share_layers = mtp_share_layers
         self.mtp_loss_scaling_factor = mtp_loss_scaling_factor
@@ -219,11 +221,6 @@ class Exaone4_5_TextConfig(PreTrainedConfig):
         self._num_mtp_layers = self.num_nextn_predict_layers
         if self._num_mtp_layers > 0 and self.mtp_share_layers:
             self._num_mtp_layers = 1
-
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
-        self.pad_token_id = pad_token_id
-        self.tie_word_embeddings = tie_word_embeddings
 
         self.layer_types = layer_types
         if self.sliding_window is None:
@@ -236,7 +233,7 @@ class Exaone4_5_TextConfig(PreTrainedConfig):
                 for i in range(self.num_hidden_layers)
             ]
         if self._num_mtp_layers > 0 and len(self.layer_types) < self.num_hidden_layers + self._num_mtp_layers:
-            self.layer_types += ["sliding_attention"] * (
+            self.layer_types += ["sliding_attention" if self.sliding_window is not None else "full_attention"] * (
                 self.num_hidden_layers + self._num_mtp_layers - len(self.layer_types)
             )
         layer_type_validation(self.layer_types, self.num_hidden_layers + self._num_mtp_layers)
@@ -259,8 +256,8 @@ class Exaone4_5_Config(PretrainedConfig):
         self,
         text_config=None,
         vision_config=None,
-        image_token_id=349,
-        video_token_id=350,
+        image_token_id=67,
+        video_token_id=68,
         **kwargs,
     ):
         # We need to init super() here so that it does not reset values
@@ -287,7 +284,7 @@ class Exaone4_5_Config(PretrainedConfig):
     def __setattr__(self, key, value):
         if (
             (text_config := super().__getattribute__("__dict__").get("text_config")) is not None
-            and key not in ["dtype", "architectures", "_attn_implementation_internal"]
+            and key not in ["dtype", "architectures", "_attn_implementation_internal", "model_type"]
             and key in text_config.__dict__
         ):
             setattr(text_config, key, value)
@@ -299,6 +296,7 @@ class Exaone4_5_Config(PretrainedConfig):
             "dtype",
             "architectures",
             "_attn_implementation_internal",
+            "model_type",
         ]:
             text_config = super().__getattribute__("text_config")
             if key in text_config.__dict__:

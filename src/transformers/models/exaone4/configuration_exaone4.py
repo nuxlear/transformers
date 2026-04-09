@@ -148,6 +148,9 @@ class Exaone4Config(PreTrainedConfig):
         sliding_window: int | None = 4096,
         sliding_window_pattern: int | None = 4,
         layer_types: list[str] | None = None,
+        num_nextn_predict_layers: int | None = 0,
+        mtp_share_layers: bool | None = False,
+        mtp_loss_scaling_factor: float | None = 0.2,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -168,6 +171,13 @@ class Exaone4Config(PreTrainedConfig):
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
         self.tie_word_embeddings = tie_word_embeddings
+        self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.mtp_share_layers = mtp_share_layers
+        self.mtp_loss_scaling_factor = mtp_loss_scaling_factor
+
+        self._num_mtp_layers = self.num_nextn_predict_layers
+        if self._num_mtp_layers > 0 and self.mtp_share_layers:
+            self._num_mtp_layers = 1
 
         self.layer_types = layer_types
         if self.sliding_window is None:
@@ -180,7 +190,7 @@ class Exaone4Config(PreTrainedConfig):
                 for i in range(self.num_hidden_layers)
             ]
         if self._num_mtp_layers > 0 and len(self.layer_types) < self.num_hidden_layers + self._num_mtp_layers:
-            self.layer_types += ["sliding_attention"] * (
+            self.layer_types += ["sliding_attention" if self.sliding_window is not None else "full_attention"] * (
                 self.num_hidden_layers + self._num_mtp_layers - len(self.layer_types)
             )
         layer_type_validation(self.layer_types, self.num_hidden_layers + self._num_mtp_layers)

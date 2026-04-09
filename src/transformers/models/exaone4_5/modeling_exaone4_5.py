@@ -4,7 +4,6 @@
 #             the file from the modular. If any change should be done, please apply the change to the
 #                          modular_exaone4_5.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
-# coding=utf-8
 # Copyright 2025 The LG AI Research and HuggingFace Inc. team. All rights reserved.
 #
 #
@@ -20,6 +19,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -28,8 +28,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from transformers.utils.generic import check_model_inputs
-
+from ... import initialization as init
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
@@ -45,11 +44,11 @@ from ...utils import (
     auto_docstring,
     can_return_tuple,
     is_grouped_mm_available,
-    is_torchdynamo_compiling,
     logging,
     torch_compilable_check,
 )
-from ...utils.generic import maybe_autocast
+from ...utils.generic import is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
+from ...utils.output_capturing import capture_outputs
 from .configuration_exaone4_5 import Exaone4_5_Config, Exaone4_5_TextConfig, Exaone4_5_VisionConfig
 
 
@@ -58,7 +57,7 @@ logger = logging.get_logger(__name__)
 
 @use_kernel_forward_from_hub("RMSNorm")
 class Exaone4_5_RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
+    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
         """
         Exaone4_5_RMSNorm is equivalent to T5LayerNorm
         """
@@ -66,7 +65,7 @@ class Exaone4_5_RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -183,8 +182,7 @@ def eager_attention_forward(
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
+        attn_weights = attn_weights + attention_mask
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
@@ -263,11 +261,11 @@ class Exaone4_5_VisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
 
-        if self.config._attn_implementation == "flash_attention_2":
+        if is_flash_attention_requested(self.config):
             # Flash Attention 2: Use cu_seqlens for variable length attention
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
             attn_output, _ = attention_interface(
@@ -607,6 +605,12 @@ class Exaone4_5_PreTrainedModel(PreTrainedModel):
     config_class = Exaone4_5_Config
     _keys_to_ignore_on_load_unexpected = [r"mtp.*"]
 
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        if isinstance(module, Exaone4_5_VisionRotaryEmbedding):
+            inv_freq = 1.0 / (module.theta ** (torch.arange(0, module.dim, 2, dtype=torch.float) / module.dim))
+            init.copy_(module.inv_freq, inv_freq)
+
 
 class Exaone4_5_VisionPreTrainedModel(Exaone4_5_PreTrainedModel):
     config: Exaone4_5_VisionConfig
@@ -647,7 +651,7 @@ class Exaone4_5_VisionPreTrainedModel(Exaone4_5_PreTrainedModel):
 
     def rot_pos_emb(self, grid_thw):
         pos_ids = []
-        for t, h, w in grid_thw:
+        for t, h, w in grid_thw.tolist():
             hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
             hpos_ids = hpos_ids.reshape(
                 h // self.spatial_merge_size,
@@ -679,8 +683,9 @@ class Exaone4_5_VisionPreTrainedModel(Exaone4_5_PreTrainedModel):
         cu_window_seqlens: list = [0]
         window_index_id = 0
         vit_merger_window_size = self.window_size // self.spatial_merge_size // self.patch_size
+        grid_thw_list = grid_thw.tolist()
 
-        for grid_t, grid_h, grid_w in grid_thw:
+        for grid_t, grid_h, grid_w in grid_thw_list:
             llm_grid_h, llm_grid_w = (
                 grid_h // self.spatial_merge_size,
                 grid_w // self.spatial_merge_size,
@@ -710,12 +715,13 @@ class Exaone4_5_VisionPreTrainedModel(Exaone4_5_PreTrainedModel):
             window_index.append(index_new + window_index_id)
             cu_seqlens_tmp = seqlens.cumsum(0) * self.spatial_merge_unit + cu_window_seqlens[-1]
             cu_window_seqlens.extend(cu_seqlens_tmp.tolist())
-            window_index_id += (grid_t * llm_grid_h * llm_grid_w).item()
+            window_index_id += grid_t * llm_grid_h * llm_grid_w
         window_index = torch.cat(window_index, dim=0)
 
         return window_index, cu_window_seqlens
 
-    @check_model_inputs
+    @merge_with_config_defaults
+    @capture_outputs
     def forward(
         self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs: Unpack[TransformersKwargs]
     ) -> tuple | BaseModelOutputWithPooling:
@@ -867,7 +873,8 @@ class Exaone4_5_TextModel(Exaone4_5_PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs
+    @merge_with_config_defaults
+    @capture_outputs
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -902,7 +909,7 @@ class Exaone4_5_TextModel(Exaone4_5_PreTrainedModel):
             # Prepare mask arguments
             mask_kwargs = {
                 "config": self.config,
-                "input_embeds": inputs_embeds,
+                "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
                 "cache_position": cache_position,
                 "past_key_values": past_key_values,
@@ -971,6 +978,7 @@ class Exaone4_5_Model(Exaone4_5_PreTrainedModel):
         video_grid_thw: torch.LongTensor | None = None,
         second_per_grid_ts: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Calculate the 3D rope index based on image and video's temporal, height and width in LLM.
@@ -1030,124 +1038,89 @@ class Exaone4_5_Model(Exaone4_5_PreTrainedModel):
         video_token_id = self.config.video_token_id
         vision_start_token_id = self.config.vision_start_token_id
         mrope_position_deltas = []
-        if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
-            total_input_ids = input_ids
+
+        total_input_ids = input_ids
+        if attention_mask is not None:
+            attention_mask = attention_mask == 1
+        position_ids = torch.zeros(
+            3,
+            input_ids.shape[0],
+            input_ids.shape[1],
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        image_grid_thw_list = image_grid_thw.tolist() if image_grid_thw is not None else None
+        video_grid_thw_list = video_grid_thw.tolist() if video_grid_thw is not None else None
+        image_index, video_index = 0, 0
+        for i, input_ids in enumerate(total_input_ids):
             if attention_mask is not None:
-                attention_mask = attention_mask == 1
-            position_ids = torch.ones(
-                3,
-                input_ids.shape[0],
-                input_ids.shape[1],
-                dtype=input_ids.dtype,
-                device=input_ids.device,
-            )
-            image_index, video_index = 0, 0
-            for i, input_ids in enumerate(total_input_ids):
-                if attention_mask is not None:
-                    input_ids = input_ids[attention_mask[i]]
-                image_nums, video_nums = 0, 0
-                vision_start_indices = torch.argwhere(input_ids == vision_start_token_id).squeeze(1)
-                vision_tokens = input_ids[vision_start_indices + 1]
-                image_nums = (vision_tokens == image_token_id).sum()
-                video_nums = (vision_tokens == video_token_id).sum()
-                input_tokens = input_ids.tolist()
-                llm_pos_ids_list: list = []
-                st = 0
-                remain_images, remain_videos = image_nums, video_nums
-                for _ in range(image_nums + video_nums):
-                    if image_token_id in input_tokens and remain_images > 0:
-                        ed_image = input_tokens.index(image_token_id, st)
-                    else:
-                        ed_image = len(input_tokens) + 1
-                    if video_token_id in input_tokens and remain_videos > 0:
-                        ed_video = input_tokens.index(video_token_id, st)
-                    else:
-                        ed_video = len(input_tokens) + 1
-                    if ed_image < ed_video:
-                        t, h, w = (
-                            image_grid_thw[image_index][0],
-                            image_grid_thw[image_index][1],
-                            image_grid_thw[image_index][2],
-                        )
-                        second_per_grid_t = 0
-                        image_index += 1
-                        remain_images -= 1
-                        ed = ed_image
-
-                    else:
-                        t, h, w = (
-                            video_grid_thw[video_index][0],
-                            video_grid_thw[video_index][1],
-                            video_grid_thw[video_index][2],
-                        )
-                        if second_per_grid_ts is not None:
-                            second_per_grid_t = second_per_grid_ts[video_index]
-                        else:
-                            second_per_grid_t = 1.0
-                        video_index += 1
-                        remain_videos -= 1
-                        ed = ed_video
-                    llm_grid_t, llm_grid_h, llm_grid_w = (
-                        t.item(),
-                        h.item() // spatial_merge_size,
-                        w.item() // spatial_merge_size,
-                    )
-                    text_len = ed - st
-
-                    st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
-                    llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
-
-                    range_tensor = torch.arange(llm_grid_t).view(-1, 1)
-                    expanded_range = range_tensor.expand(-1, llm_grid_h * llm_grid_w)
-
-                    ## normalize type, send to device.
-                    second_per_grid_t = torch.as_tensor(
-                        second_per_grid_t, dtype=range_tensor.dtype, device=range_tensor.device
-                    )
-
-                    time_tensor = expanded_range * second_per_grid_t * self.config.vision_config.tokens_per_second
-
-                    time_tensor_long = time_tensor.long()
-                    t_index = time_tensor_long.flatten()
-
-                    h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
-                    w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
-                    llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
-                    st = ed + llm_grid_t * llm_grid_h * llm_grid_w
-
-                if st < len(input_tokens):
-                    st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
-                    text_len = len(input_tokens) - st
-                    llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
-
-                llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
-                if attention_mask is not None:
-                    position_ids[..., i, attention_mask[i]] = llm_positions.to(position_ids.device)
+                input_ids = input_ids[attention_mask[i]]
+            image_nums, video_nums = 0, 0
+            vision_start_indices = torch.argwhere(input_ids == vision_start_token_id).squeeze(1)
+            vision_tokens = input_ids[vision_start_indices + 1]
+            image_nums = (vision_tokens == image_token_id).sum()
+            video_nums = (vision_tokens == video_token_id).sum()
+            input_tokens = input_ids.tolist()
+            llm_pos_ids_list: list = []
+            st = 0
+            remain_images, remain_videos = image_nums, video_nums
+            for _ in range(image_nums + video_nums):
+                if image_token_id in input_tokens and remain_images > 0:
+                    ed_image = input_tokens.index(image_token_id, st)
                 else:
-                    position_ids[..., i, :] = llm_positions.to(position_ids.device)
-                mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
-            mrope_position_deltas = torch.tensor(mrope_position_deltas).unsqueeze(1).to(device=input_ids.device)
-            return position_ids, mrope_position_deltas
-        else:
+                    ed_image = len(input_tokens) + 1
+                if video_token_id in input_tokens and remain_videos > 0:
+                    ed_video = input_tokens.index(video_token_id, st)
+                else:
+                    ed_video = len(input_tokens) + 1
+                if ed_image < ed_video:
+                    t, h, w = image_grid_thw_list[image_index]
+                    second_per_grid_t = 0
+                    image_index += 1
+                    remain_images -= 1
+                    ed = ed_image
+                else:
+                    t, h, w = video_grid_thw_list[video_index]
+                    if second_per_grid_ts is not None:
+                        second_per_grid_t = second_per_grid_ts[video_index]
+                    else:
+                        second_per_grid_t = 1.0
+                    video_index += 1
+                    remain_videos -= 1
+                    ed = ed_video
+                llm_grid_t, llm_grid_h, llm_grid_w = (
+                    t,
+                    h // spatial_merge_size,
+                    w // spatial_merge_size,
+                )
+                text_len = ed - st
+                st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+                range_tensor = torch.arange(llm_grid_t).view(-1, 1)
+                expanded_range = range_tensor.expand(-1, llm_grid_h * llm_grid_w)
+                ## normalize type, send to device.
+                second_per_grid_t = torch.as_tensor(
+                    second_per_grid_t, dtype=range_tensor.dtype, device=range_tensor.device
+                )
+                time_tensor = expanded_range * second_per_grid_t * self.config.vision_config.tokens_per_second
+                time_tensor_long = time_tensor.long()
+                t_index = time_tensor_long.flatten()
+                h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
+                w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+                llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
+                st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+            if st < len(input_tokens):
+                st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                text_len = len(input_tokens) - st
+                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
             if attention_mask is not None:
-                position_ids = attention_mask.long().cumsum(-1) - 1
-                position_ids.masked_fill_(attention_mask == 0, 1)
-                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
-                max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+                position_ids[..., i, attention_mask[i]] = llm_positions.to(position_ids.device)
             else:
-                position_ids = (
-                    torch.arange(input_ids.shape[1], device=input_ids.device)
-                    .view(1, 1, -1)
-                    .expand(3, input_ids.shape[0], -1)
-                )
-                mrope_position_deltas = torch.zeros(
-                    [input_ids.shape[0], 1],
-                    device=input_ids.device,
-                    dtype=input_ids.dtype,
-                )
-
-            return position_ids, mrope_position_deltas
+                position_ids[..., i, :] = llm_positions.to(position_ids.device)
+            mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
+        mrope_position_deltas = torch.tensor(mrope_position_deltas).unsqueeze(1).to(device=input_ids.device)
+        return position_ids, mrope_position_deltas
 
     @can_return_tuple
     @auto_docstring
@@ -1234,6 +1207,45 @@ class Exaone4_5_Model(Exaone4_5_PreTrainedModel):
             )
         return special_image_mask, special_video_mask
 
+    def compute_3d_position_ids(
+        self,
+        input_ids: torch.Tensor | None,
+        image_grid_thw: torch.Tensor | None,
+        video_grid_thw: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        attention_mask: torch.Tensor | None,
+        past_key_values: torch.Tensor | None,
+        second_per_grid_ts: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        past_key_values_length = 0 if past_key_values is None else past_key_values.get_seq_length()
+        can_compute_mrope = input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None)
+
+        if can_compute_mrope and (self.rope_deltas is None or past_key_values_length == 0):
+            position_ids, rope_deltas = self.get_rope_index(
+                input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                attention_mask=attention_mask,
+                second_per_grid_ts=second_per_grid_ts,
+            )
+            self.rope_deltas = rope_deltas
+        # Use pre-calculated rope-deltas to infer correct 3D position ids
+        elif self.rope_deltas is not None:
+            batch_size, seq_length, _ = inputs_embeds.shape
+            if attention_mask is not None:
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids = position_ids.masked_fill(attention_mask == 0, 0)
+                position_ids = position_ids.view(1, batch_size, -1).repeat(3, 1, 1).to(inputs_embeds.device)
+            else:
+                position_ids = torch.arange(past_key_values_length, past_key_values_length + seq_length)
+                position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1).to(inputs_embeds.device)
+            delta = self.rope_deltas.repeat_interleave(batch_size // self.rope_deltas.shape[0], dim=0)
+            position_ids = position_ids + delta.to(device=position_ids.device)
+        else:
+            # Can't build correct 3D positions. Let the model infer it from `cache_position`
+            position_ids = None
+        return position_ids
+
     @auto_docstring
     def forward(
         self,
@@ -1263,41 +1275,22 @@ class Exaone4_5_Model(Exaone4_5_PreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
-            if pixel_values is not None:
-                image_embeds = self.get_image_features(pixel_values, image_grid_thw)
-                image_embeds = torch.cat(image_embeds, dim=0)
-                n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
-                n_image_features = image_embeds.shape[0]
-                if not is_torchdynamo_compiling() and n_image_tokens != n_image_features:
-                    raise ValueError(
-                        f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
-                    )
-                image_mask = (
-                    (input_ids == self.config.image_token_id)
-                    .unsqueeze(-1)
-                    .expand_as(inputs_embeds)
-                    .to(inputs_embeds.device)
-                )
-                image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-            if pixel_values_videos is not None:
-                video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
-                video_embeds = torch.cat(video_embeds, dim=0)
-                n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
-                n_video_features = video_embeds.shape[0]
-                if not is_torchdynamo_compiling() and n_video_tokens != n_video_features:
-                    raise ValueError(
-                        f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
-                    )
-                video_mask = (
-                    (input_ids == self.config.video_token_id)
-                    .unsqueeze(-1)
-                    .expand_as(inputs_embeds)
-                    .to(inputs_embeds.device)
-                )
-                video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+        if pixel_values is not None:
+            image_embeds = self.get_image_features(pixel_values, image_grid_thw, return_dict=True).pooler_output
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        if pixel_values_videos is not None:
+            video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True).pooler_output
+            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            _, video_mask = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -1307,24 +1300,6 @@ class Exaone4_5_Model(Exaone4_5_PreTrainedModel):
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-
-        # It may already have been prepared by e.g. `generate`
-        if not isinstance(causal_mask_mapping := attention_mask, dict):
-            # Prepare mask arguments
-            mask_kwargs = {
-                "config": self.config.text_config,
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-            }
-            # Create the masks
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-            }
-            if self.config.text_config.sliding_window is not None:
-                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
         outputs = self.language_model(
             input_ids=None,
@@ -1601,7 +1576,7 @@ class Exaone4_5_ForConditionalGeneration(Exaone4_5_PreTrainedModel, GenerationMi
             **kwargs,
         )
 
-        # EXAONE-4.0-VL uses position_ids of text model, not using rope_deltas
+        # EXAONE-4.5 uses position_ids of text model, not using rope_deltas
         model_inputs["position_ids"] = None
 
         if cache_position[0] != 0:
@@ -1609,6 +1584,42 @@ class Exaone4_5_ForConditionalGeneration(Exaone4_5_PreTrainedModel, GenerationMi
             model_inputs["pixel_values_videos"] = None
 
         return model_inputs
+
+    def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
+        # Overwritten -- requires 3D position ids
+
+        text_positions = super()._prepare_position_ids_for_generation(inputs_tensor, model_kwargs)
+
+        # Early exit in case we are continuing generation from past kv
+        past_length = 0
+        if (cache := model_kwargs.get("past_key_values")) is not None:
+            past_length = cache.get_seq_length()
+        if past_length != 0 and self.model.rope_deltas is not None:
+            position_ids = text_positions[None, ...] + self.model.rope_deltas
+            return position_ids
+
+        # Otherwise compute 3d position ids for vision tokens and concat with text position ids
+        if "input_ids" in model_kwargs and model_kwargs["input_ids"].shape[1] > 0:
+            inputs_tensor = model_kwargs["input_ids"]
+
+        is_input_ids = len(inputs_tensor.shape) == 2 and inputs_tensor.dtype in [torch.int, torch.long]
+        if is_input_ids and (
+            model_kwargs.get("image_grid_thw") is not None or model_kwargs.get("video_grid_thw") is not None
+        ):
+            model_kwargs = {k: v for k, v in model_kwargs.items() if k != "input_ids"}
+            vision_positions, rope_deltas = self.model.get_rope_index(inputs_tensor, **model_kwargs)
+            self.model.rope_deltas = rope_deltas
+        else:
+            vision_positions = text_positions.unsqueeze(0).expand(3, -1, -1)
+            self.model.rope_deltas = torch.zeros(
+                inputs_tensor.shape[0], 1, dtype=torch.long, device=inputs_tensor.device
+            )
+
+        # Concatenate "text + vision" positions into [4, bs, seq-len]
+        text_positions = text_positions[None, ...]
+        position_ids = torch.cat([text_positions, vision_positions], dim=0)
+
+        return position_ids
 
     def _get_image_nums_and_video_nums(
         self,
@@ -1725,7 +1736,9 @@ class Exaone4_5_ForConditionalGeneration(Exaone4_5_PreTrainedModel, GenerationMi
 
         def _expand_dict_for_generation(dict_to_expand):
             for key in dict_to_expand:
-                if (
+                if key == "position_ids" and dict_to_expand[key].ndim == 3:
+                    dict_to_expand[key] = dict_to_expand[key].repeat_interleave(expand_size, dim=1)
+                elif (
                     key != "cache_position"
                     and dict_to_expand[key] is not None
                     and isinstance(dict_to_expand[key], torch.Tensor)

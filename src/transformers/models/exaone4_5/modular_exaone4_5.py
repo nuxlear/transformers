@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2025 The LG AI Research and HuggingFace Inc. team. All rights reserved.
 #
 #
@@ -15,7 +14,6 @@
 # limitations under the License.
 """LG AI Research EXAONE Lab"""
 
-from typing import Optional, Union
 
 import torch
 import torch.utils.checkpoint
@@ -40,14 +38,10 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLVisionBlock,
 )
 from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import (
-    Qwen2_5_VLImagesKwargs,
     Qwen2_5_VLProcessor,
-    Qwen2_5_VLProcessorKwargs,
-    Qwen2_5_VLVideosProcessorKwargs,
 )
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
 from transformers.models.qwen2_vl.image_processing_qwen2_vl_fast import (
-    Qwen2VLFastImageProcessorKwargs,
     Qwen2VLImageProcessorFast,
 )
 from transformers.models.qwen2_vl.modeling_qwen2_vl import (
@@ -57,17 +51,16 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 )
 from transformers.models.qwen2_vl.video_processing_qwen2_vl import (
     Qwen2VLVideoProcessor,
-    Qwen2VLVideoProcessorInitKwargs,
 )
 
+from ... import initialization as init
 from ...configuration_utils import PretrainedConfig
-from ...masking_utils import create_causal_mask, create_sliding_window_causal_mask
-from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from ...masking_utils import create_sliding_window_causal_mask
+from ...modeling_outputs import BaseModelOutputWithPast
 from ...processing_utils import Unpack
 from ...utils import (
     TransformersKwargs,
     is_grouped_mm_available,
-    is_torchdynamo_compiling,
     logging,
 )
 
@@ -145,8 +138,8 @@ class Exaone4_5_Config(PretrainedConfig):
         self,
         text_config=None,
         vision_config=None,
-        image_token_id=349,
-        video_token_id=350,
+        image_token_id=67,
+        video_token_id=68,
         **kwargs,
     ):
         # We need to init super() here so that it does not reset values
@@ -169,11 +162,11 @@ class Exaone4_5_Config(PretrainedConfig):
 
         # Attention implementation to use. It sets it recursively on sub-configs so we call it again in the end
         self._attn_implementation = kwargs.pop("attn_implementation", None)
-    
+
     def __setattr__(self, key, value):
         if (
             (text_config := super().__getattribute__("__dict__").get("text_config")) is not None
-            and key not in ["dtype", "architectures", "_attn_implementation_internal"]
+            and key not in ["dtype", "architectures", "_attn_implementation_internal", "model_type"]
             and key in text_config.__dict__
         ):
             setattr(text_config, key, value)
@@ -185,6 +178,7 @@ class Exaone4_5_Config(PretrainedConfig):
             "dtype",
             "architectures",
             "_attn_implementation_internal",
+            "model_type",
         ]:
             text_config = super().__getattribute__("text_config")
             if key in text_config.__dict__:
@@ -230,8 +224,8 @@ class Exaone4_5_VisionAttention(Qwen2_5_VLVisionAttention):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        rotary_pos_emb: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        rotary_pos_emb: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
@@ -274,11 +268,11 @@ class Exaone4_5_VisionAttention(Qwen2_5_VLVisionAttention):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
 
-        if self.config._attn_implementation == "flash_attention_2":
+        if is_flash_attention_requested(self.config):
             # Flash Attention 2: Use cu_seqlens for variable length attention
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
             attn_output, _ = attention_interface(
@@ -355,6 +349,12 @@ class Exaone4_5_PreTrainedModel(Exaone4PreTrainedModel):
     )  # https://huggingface.co/docs/transformers/experts_interface#torchcompile
     _keys_to_ignore_on_load_unexpected = [r"mtp.*"]
 
+    def _init_weights(self, module):
+        PreTrainedModel._init_weights(module)
+        if isinstance(module, Exaone4_5_VisionRotaryEmbedding):
+            inv_freq = 1.0 / (module.theta ** (torch.arange(0, module.dim, 2, dtype=torch.float) / module.dim))
+            init.copy_(module.inv_freq, inv_freq)
+
 
 class Exaone4_5_VisionPreTrainedModel(Exaone4_5_PreTrainedModel, Qwen2_5_VisionTransformerPretrainedModel):
     config_class = Exaone4_5_VisionConfig
@@ -401,18 +401,18 @@ class Exaone4_5_Model(Exaone4_5_PreTrainedModel, Qwen2_5_VLModel):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[list[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        pixel_values_videos: Optional[torch.FloatTensor] = None,
-        image_grid_thw: Optional[torch.LongTensor] = None,
-        video_grid_thw: Optional[torch.LongTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: list[torch.FloatTensor] | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.FloatTensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        video_grid_thw: torch.LongTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[tuple, BaseModelOutputWithPast]:
+    ) -> tuple | BaseModelOutputWithPast:
         r"""
         pixel_values_videos (`torch.FloatTensor` of shape `(seq_length, num_channels * temporal_size * image_size * image_size)):
             The tensors corresponding to the input videos. Pixel values can be obtained using
@@ -426,41 +426,22 @@ class Exaone4_5_Model(Exaone4_5_PreTrainedModel, Qwen2_5_VLModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
-            if pixel_values is not None:
-                image_embeds = self.get_image_features(pixel_values, image_grid_thw)
-                image_embeds = torch.cat(image_embeds, dim=0)
-                n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
-                n_image_features = image_embeds.shape[0]
-                if not is_torchdynamo_compiling() and n_image_tokens != n_image_features:
-                    raise ValueError(
-                        f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
-                    )
-                image_mask = (
-                    (input_ids == self.config.image_token_id)
-                    .unsqueeze(-1)
-                    .expand_as(inputs_embeds)
-                    .to(inputs_embeds.device)
-                )
-                image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-            if pixel_values_videos is not None:
-                video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
-                video_embeds = torch.cat(video_embeds, dim=0)
-                n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
-                n_video_features = video_embeds.shape[0]
-                if not is_torchdynamo_compiling() and n_video_tokens != n_video_features:
-                    raise ValueError(
-                        f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
-                    )
-                video_mask = (
-                    (input_ids == self.config.video_token_id)
-                    .unsqueeze(-1)
-                    .expand_as(inputs_embeds)
-                    .to(inputs_embeds.device)
-                )
-                video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+        if pixel_values is not None:
+            image_embeds = self.get_image_features(pixel_values, image_grid_thw, return_dict=True).pooler_output
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        if pixel_values_videos is not None:
+            video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True).pooler_output
+            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            _, video_mask = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -470,24 +451,6 @@ class Exaone4_5_Model(Exaone4_5_PreTrainedModel, Qwen2_5_VLModel):
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-
-        # It may already have been prepared by e.g. `generate`
-        if not isinstance(causal_mask_mapping := attention_mask, dict):
-            # Prepare mask arguments
-            mask_kwargs = {
-                "config": self.config.text_config,
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-            }
-            # Create the masks
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-            }
-            if self.config.text_config.sliding_window is not None:
-                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
         outputs = self.language_model(
             input_ids=None,
@@ -525,18 +488,18 @@ class Exaone4_5_ForConditionalGeneration(Exaone4_5_PreTrainedModel, Qwen2_5_VLFo
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[list[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        pixel_values_videos: Optional[torch.FloatTensor] = None,
-        image_grid_thw: Optional[torch.LongTensor] = None,
-        video_grid_thw: Optional[torch.LongTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        second_per_grid_ts: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: list[torch.FloatTensor] | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.FloatTensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        video_grid_thw: torch.LongTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
+        second_per_grid_ts: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Exaone4_5_CausalLMOutputWithPast:
@@ -641,7 +604,7 @@ class Exaone4_5_ForConditionalGeneration(Exaone4_5_PreTrainedModel, Qwen2_5_VLFo
                     past_key_values=past_key_values,
                     position_ids=position_ids,
                 )
-                
+
                 mtp_hidden_states = self.mtp(
                     layer_idx=0 if self.config.mtp_share_layers else layer_idx,
                     hidden_states=mtp_hidden_states,
@@ -709,7 +672,7 @@ class Exaone4_5_ForConditionalGeneration(Exaone4_5_PreTrainedModel, Qwen2_5_VLFo
             **kwargs,
         )
 
-        # EXAONE-4.0-VL uses position_ids of text model, not using rope_deltas
+        # EXAONE-4.5 uses position_ids of text model, not using rope_deltas
         model_inputs["position_ids"] = None
 
         if cache_position[0] != 0:
